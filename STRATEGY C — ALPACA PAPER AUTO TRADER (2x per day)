@@ -1,0 +1,351 @@
+# =========================
+# STRATEGY C — ALPACA PAPER AUTO TRADER (2x per day)
+# Matches paper: 10 bps costs, turnover cap, quarterly re-optimisation
+# =========================
+
+import os
+import json
+import time
+import math
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+# pip install alpaca-trade-api yfinance
+from alpaca_trade_api.rest import REST, APIError
+
+
+# ----- Paper-aligned knobs -----
+TRADING_COST_BPS = 10            # 0.10% one-way
+TURNOVER_CAP = 0.35              # max turnover per rebalance
+REOPT_FREQ_DAYS = 63             # ~quarterly trading days
+TRADE_TIMES = ["OPEN", "CLOSE"]  # your scheduler should call run_cycle("OPEN") and run_cycle("CLOSE")
+MIN_DOLLAR_TRADE = 200
+MAX_NOTIONAL_PER_ORDER = 12_500
+BUYING_POWER_BUFFER = 0.995
+SLEEP_BETWEEN_ORDERS_S = 0.12
+
+# Universe (keep your existing list; trimmed example here)
+UNIVERSE = [
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","AVGO","JPM","BAC","GS",
+    "UNH","JNJ","LLY","XOM","CVX","CAT","LMT","COST","WMT","KO","PG",
+    "SPY","QQQ","IWM","DIA","XLK","XLF","XLV","GLD","TLT"
+]
+
+STATE_FILE = "alpaca_strategy_state.json"
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _load_state() -> dict:
+    if not os.path.exists(STATE_FILE):
+        return {"last_reopt_utc": None, "last_weights": {}, "paper_costs_est": 0.0}
+    with open(STATE_FILE, "r") as f:
+        return json.load(f)
+
+
+def _save_state(st: dict) -> None:
+    with open(STATE_FILE, "w") as f:
+        json.dump(st, f, indent=2)
+
+
+def _connect_alpaca() -> Tuple[REST, float, bool, bool]:
+    """
+    Uses env vars:
+      APCA_API_KEY_ID, APCA_API_SECRET_KEY, APCA_PAPER_BASE_URL (default paper endpoint)
+    """
+    key = (os.getenv("APCA_API_KEY_ID") or "").strip()
+    sec = (os.getenv("APCA_API_SECRET_KEY") or "").strip()
+    base = (os.getenv("APCA_PAPER_BASE_URL") or "https://paper-api.alpaca.markets").strip()
+
+    dry = False
+    if not key or not sec:
+        print("⚠️ Missing Alpaca env vars. Running DRY_RUN (signals only).")
+        dry = True
+        return None, 100_000.0, False, dry
+
+    if "paper" not in base:
+        base = "https://paper-api.alpaca.markets"
+
+    try:
+        api = REST(key_id=key, secret_key=sec, base_url=base)
+        acct = api.get_account()
+        equity = float(acct.equity)
+        is_open = bool(api.get_clock().is_open)
+        return api, equity, is_open, dry
+    except Exception as e:
+        print("⚠️ Alpaca auth failed. DRY_RUN (signals only). Error:", repr(e))
+        return None, 100_000.0, False, True
+
+
+def _download_prices(tickers: List[str], years: float = 1.5) -> pd.DataFrame:
+    end = _now_utc()
+    start = end - timedelta(days=int(365 * years * 1.1))
+    df = yf.download(" ".join(tickers), start=start, end=end, interval="1d",
+                     auto_adjust=True, progress=False, group_by="ticker")
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    close = {}
+    for t in tickers:
+        try:
+            sub = df[t] if isinstance(df.columns, pd.MultiIndex) else df
+            s = sub["Close"].rename(t).dropna()
+            if not s.empty:
+                close[t] = s
+        except Exception:
+            pass
+    if not close:
+        return pd.DataFrame()
+    return pd.DataFrame(close).ffill().dropna(how="all")
+
+
+def _ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False).mean()
+
+
+def _rsi(s: pd.Series, n: int = 14) -> pd.Series:
+    d = s.diff()
+    up = d.clip(lower=0)
+    dn = -d.clip(upper=0)
+    rs = up.rolling(n).mean() / (dn.rolling(n).mean() + 1e-12)
+    return 100 - (100 / (1 + rs))
+
+
+def _macd_hist(s: pd.Series) -> pd.Series:
+    m12 = _ema(s, 12)
+    m26 = _ema(s, 26)
+    macd = m12 - m26
+    sig = _ema(macd, 9)
+    return macd - sig
+
+
+def _zscore(x: pd.Series) -> pd.Series:
+    z = (x - x.mean()) / (x.std() + 1e-12)
+    return z.replace([np.inf, -np.inf], 0).fillna(0)
+
+
+def compute_rank_signal(px: pd.DataFrame) -> pd.Series:
+    """
+    Momentum/indicator style score per your paper (simple, robust).
+    Higher score -> preferred long. We’ll run long-only to keep it clean and paper-aligned.
+    """
+    last = px.iloc[-1]
+    rets = px.pct_change()
+
+    mom6_1 = px.pct_change(126).shift(21).iloc[-1]             # 6m momentum, skip last month
+    sma50 = px.rolling(50).mean().iloc[-1]
+    sma200 = px.rolling(200).mean().iloc[-1]
+    dist200 = (last - sma200) / (sma200 + 1e-12)
+    macdh = px.apply(_macd_hist).iloc[-1]
+    rsi14 = px.apply(_rsi).iloc[-1]
+    rsi_pref = -((rsi14 - 55.0).abs())
+    vol20 = rets.rolling(20).std().iloc[-1] * np.sqrt(252)
+
+    score = (
+        0.40 * _zscore(mom6_1) +
+        0.25 * _zscore(dist200) +
+        0.20 * _zscore(macdh) +
+        0.10 * _zscore(rsi_pref) -
+        0.15 * _zscore(vol20)
+    )
+    return score.sort_values(ascending=False)
+
+
+def build_target_weights(px: pd.DataFrame, top_n: int = 20) -> Dict[str, float]:
+    ranked = compute_rank_signal(px)
+    picks = list(ranked.index[:top_n])
+
+    # inverse-vol weights
+    vol = px[picks].pct_change().rolling(20).std().iloc[-1] * np.sqrt(252)
+    vol = vol.replace([np.inf, -np.inf], np.nan).fillna(vol.median())
+    inv = 1.0 / (vol + 1e-12)
+    w = inv / inv.sum()
+    return {t: float(w[t]) for t in picks}
+
+
+def apply_turnover_cap(prev_w: Dict[str, float], new_w: Dict[str, float], cap: float) -> Dict[str, float]:
+    if not prev_w:
+        return new_w
+
+    all_t = set(prev_w) | set(new_w)
+    # current delta per name
+    delta = {t: new_w.get(t, 0.0) - prev_w.get(t, 0.0) for t in all_t}
+    turnover = 0.5 * sum(abs(d) for d in delta.values())
+    if turnover <= cap + 1e-12:
+        return new_w
+
+    # scale trades down to meet cap, keep portfolio normalized
+    scale = cap / (turnover + 1e-12)
+    adj = {t: prev_w.get(t, 0.0) + scale * delta[t] for t in all_t}
+    # remove tiny negatives from numeric noise, renormalize
+    adj = {t: max(0.0, v) for t, v in adj.items() if v > 1e-6}
+    s = sum(adj.values())
+    if s <= 0:
+        return prev_w
+    return {t: v / s for t, v in adj.items()}
+
+
+def _get_positions(api: REST) -> Dict[str, int]:
+    pos = {}
+    for p in api.list_positions():
+        pos[p.symbol] = int(float(p.qty))
+    return pos
+
+
+def _get_buying_power(api: REST) -> float:
+    acct = api.get_account()
+    return float(acct.buying_power)
+
+
+def _dollars_to_qty(dollars: float, price: float) -> int:
+    if price <= 0:
+        return 0
+    dollars = math.copysign(min(abs(dollars), MAX_NOTIONAL_PER_ORDER), dollars)
+    if abs(dollars) < MIN_DOLLAR_TRADE:
+        return 0
+    return int(math.floor(abs(dollars) / price))
+
+
+def run_cycle(phase: str = "OPEN") -> None:
+    """
+    Call this twice per day with phase="OPEN" and phase="CLOSE".
+    Use your OS scheduler / GitHub Actions / cron.
+    """
+    if phase not in ("OPEN", "CLOSE"):
+        raise ValueError("phase must be 'OPEN' or 'CLOSE'")
+
+    st = _load_state()
+    api, equity, is_open, dry = _connect_alpaca()
+
+    print(f"\n=== ALPACA CYCLE: {phase} | UTC { _now_utc().isoformat() } ===")
+    print(f"Equity used: ${equity:,.2f} | Market open? {is_open} | DRY_RUN? {dry}")
+
+    # Pull prices and compute (or reuse) weights with quarterly re-optimisation
+    px = _download_prices(UNIVERSE, years=1.5)
+    if px.empty or len(px) < 220:
+        print("⚠️ Not enough price history. Skipping.")
+        return
+
+    last_reopt = st.get("last_reopt_utc")
+    do_reopt = True
+    if last_reopt:
+        try:
+            last_dt = datetime.fromisoformat(last_reopt)
+            do_reopt = (_now_utc() - last_dt).days >= REOPT_FREQ_DAYS
+        except Exception:
+            do_reopt = True
+
+    prev_w = st.get("last_weights", {}) or {}
+    if do_reopt or not prev_w:
+        new_w = build_target_weights(px, top_n=20)
+        new_w = apply_turnover_cap(prev_w, new_w, TURNOVER_CAP)
+        st["last_weights"] = new_w
+        st["last_reopt_utc"] = _now_utc().isoformat()
+        print(f"Re-optimised weights. Names: {len(new_w)}")
+    else:
+        new_w = prev_w
+        print("Using existing weights (within quarterly window).")
+
+    # Convert weights to target dollars
+    last_px = px.iloc[-1].to_dict()
+    targets_usd = {t: new_w.get(t, 0.0) * equity for t in new_w.keys()}
+
+    # Estimated trading cost from turnover (paper metric)
+    all_t = set(prev_w) | set(new_w)
+    turnover = 0.5 * sum(abs(new_w.get(t, 0.0) - prev_w.get(t, 0.0)) for t in all_t) if prev_w else 1.0
+    turnover_capped = min(turnover, TURNOVER_CAP)
+    est_cost = equity * turnover_capped * (TRADING_COST_BPS / 10_000)
+    st["paper_costs_est"] = float(st.get("paper_costs_est", 0.0) + est_cost)
+    print(f"Turnover raw: {turnover:.3f} | cap: {turnover_capped:.3f} | Est cost @10bps: ${est_cost:,.2f} | Cum est cost: ${st['paper_costs_est']:,.2f}")
+
+    # If dry run, stop here (signals only)
+    if dry:
+        _save_state(st)
+        display = pd.DataFrame(
+            [{"ticker": t, "weight": new_w[t], "target_$": targets_usd[t], "last_price": float(last_px.get(t, np.nan))}
+             for t in new_w.keys()]
+        ).sort_values("weight", ascending=False)
+        print("\nTop targets:")
+        print(display.head(12).to_string(index=False))
+        return
+
+    # Build desired share targets (long-only, no leverage)
+    positions = _get_positions(api)
+    buying_power = _get_buying_power(api)
+    cap_bp = buying_power * BUYING_POWER_BUFFER
+
+    desired_qty = {}
+    for t, usd in targets_usd.items():
+        p = float(last_px.get(t, np.nan))
+        if np.isnan(p):
+            continue
+        qty = _dollars_to_qty(usd, p)
+        desired_qty[t] = qty
+
+    # Flatten names not in target set
+    for sym in list(positions.keys()):
+        if sym not in desired_qty:
+            desired_qty[sym] = 0
+
+    # Phase 1: sell down first
+    sell_orders = []
+    for sym, curr in positions.items():
+        want = desired_qty.get(sym, 0)
+        delta = want - curr
+        if delta < 0:
+            sell_orders.append((sym, abs(delta)))
+
+    if sell_orders:
+        print(f"\nPhase 1: SELL {len(sell_orders)} orders")
+        for sym, qty in sell_orders:
+            try:
+                api.submit_order(symbol=sym, side="sell", qty=int(qty), type="market", time_in_force="day")
+                time.sleep(SLEEP_BETWEEN_ORDERS_S)
+            except APIError as e:
+                print("Sell error:", sym, str(e))
+
+    time.sleep(2.0)
+
+    # Refresh buying power for phase 2
+    buying_power = _get_buying_power(api)
+    cap_bp = buying_power * BUYING_POWER_BUFFER
+
+    # Phase 2: buys (BP-aware scaling)
+    buy_orders = []
+    need = 0.0
+    for sym, want in desired_qty.items():
+        curr = positions.get(sym, 0)
+        delta = want - curr
+        if delta > 0:
+            p = float(last_px.get(sym, np.nan))
+            if np.isnan(p):
+                continue
+            buy_orders.append((sym, int(delta), p))
+            need += p * int(delta)
+
+    scale = 1.0 if need <= cap_bp + 1e-12 else max(0.0, cap_bp / (need + 1e-12))
+    if buy_orders:
+        print(f"\nPhase 2: BUY {len(buy_orders)} orders | Need≈${need:,.2f} | BP cap≈${cap_bp:,.2f} | scale={scale:.3f}")
+        for sym, qty, p in buy_orders:
+            adj = int(max(0, math.floor(qty * scale)))
+            if adj <= 0:
+                continue
+            try:
+                api.submit_order(symbol=sym, side="buy", qty=int(adj), type="market", time_in_force="day")
+                time.sleep(SLEEP_BETWEEN_ORDERS_S)
+            except APIError as e:
+                print("Buy error:", sym, str(e))
+
+    _save_state(st)
+    print("\nDone.")
+
+
+# ---- How to run (manually in notebook) ----
+# run_cycle("OPEN")
+# run_cycle("CLOSE")
