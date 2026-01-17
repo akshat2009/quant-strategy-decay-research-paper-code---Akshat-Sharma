@@ -1,0 +1,219 @@
+# =========================
+# STRATEGY A — ASSET ALLOCATION (NON-AUTO)
+# Output: target weights + $ per ticker + turnover + 10 bps cost estimate
+# =========================
+
+import math
+import json
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+TRADING_COST_BPS = 10            # 0.10% one-way per trade
+TURNOVER_CAP = 0.35              # max fraction of portfolio traded per rebalance (0.35 = 35%)
+PRICE_LOOKBACK = "6mo"           # for simple scoring
+TOP_K_PER_BUCKET = 5
+
+
+@dataclass
+class AllocationInputs:
+    capital: float = 100_000
+    risk: str = "moderate"        # very low / low / moderate / high / very high
+    sentiment: float = 0.0        # -1..+1
+    include_equities: bool = True
+    include_bonds: bool = True
+    include_cmd: bool = True
+    include_crypto: bool = False
+    include_equity_etfs: bool = True
+    include_crypto_etfs: bool = False
+
+
+EQUITY_SECTORS = {
+    "Technology": ["AAPL","MSFT","NVDA","GOOG","META","AMZN","CRM","ADBE","ORCL","AMD"],
+    "Healthcare": ["JNJ","PFE","UNH","ABBV","TMO","MRK","LLY","CVS","GILD","DHR"],
+    "Finance": ["JPM","BAC","WFC","GS","MS","C","SCHW","BLK","AXP","USB"],
+    "Industrials": ["CAT","GE","HON","UPS","DE","LMT","RTX","BA","UNP","MMM"],
+    "Energy": ["XOM","CVX","COP","EOG","SLB","OXY","BP","SHEL","MPC","HES"],
+    "Consumer": ["WMT","COST","MCD","PG","KO","PEP","DIS","HD","LOW","SBUX"],
+}
+
+US_EQUITY_ETFS = ["SPY","VOO","IVV","VTI","QQQ","IWM","DIA","VGT","XLK","XLV","XLF","XLE","XLP","XLY","XLC","XLU","SMH"]
+BOND_ETFS      = ["TLT","IEF","SHY","BND","LQD","AGG","HYG","EMB","TIP","MBB"]
+CMD_ETFS       = ["GLD","SLV","DBC","USO","UNG","CORN","WEAT","SOYB","CPER","DBA"]
+CRYPTO_ETFS    = ["IBIT","FBTC","BITB","ARKB","GBTC","EETH","ETHA"]  # keep small, optional
+
+
+def _download_close(tickers: List[str], period: str) -> pd.DataFrame:
+    df = yf.download(" ".join(tickers), period=period, auto_adjust=True, progress=False, group_by="ticker")
+    if df is None or df.empty:
+        return pd.DataFrame()
+    close = {}
+    for t in tickers:
+        try:
+            sub = df[t] if isinstance(df.columns, pd.MultiIndex) else df
+            s = sub["Close"].rename(t).dropna()
+            if not s.empty:
+                close[t] = s
+        except Exception:
+            pass
+    if not close:
+        return pd.DataFrame()
+    return pd.DataFrame(close).ffill().dropna(how="all")
+
+
+def _rsi(close: pd.Series, n: int = 14) -> float:
+    ret = close.pct_change()
+    up = ret.clip(lower=0).rolling(n).mean()
+    dn = (-ret.clip(upper=0)).rolling(n).mean()
+    rs = up / (dn + 1e-12)
+    rsi = 100 - 100 / (1 + rs)
+    return float(rsi.iloc[-1])
+
+
+def _simple_score(close: pd.Series) -> float:
+    # 0..1 score: trend + sharpe-ish + RSI preference + vol penalty
+    ret = close.pct_change().dropna()
+    if ret.empty:
+        return 0.0
+    trend = float(close.iloc[-1] / close.iloc[0] - 1)
+    vol = float(ret.std() * np.sqrt(252))
+    sharpe = float((ret.mean() * 252) / (ret.std() * np.sqrt(252) + 1e-12))
+    rsi = _rsi(close)
+
+    s = 0.0
+    s += 0.35 * np.tanh(2.0 * trend)
+    s += 0.35 * np.tanh(0.7 * sharpe)
+    s += 0.20 * (1.0 - min(abs(rsi - 55.0) / 35.0, 1.0))   # prefer RSI near 55
+    s += 0.10 * (1.0 - min(vol / 0.6, 1.0))               # penalize high vol
+    return float(np.clip((s + 1) / 2, 0, 1))
+
+
+def pick_top_tickers(pool: List[str], k: int = TOP_K_PER_BUCKET) -> List[str]:
+    px = _download_close(pool, PRICE_LOOKBACK)
+    if px.empty:
+        return pool[:k]
+    scores = {t: _simple_score(px[t].dropna()) for t in px.columns}
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [t for t, _ in ranked[:k]]
+
+
+def build_asset_class_weights(risk: str, sentiment: float) -> Dict[str, float]:
+    alloc = {"equities": 0.45, "bonds": 0.25, "commodities": 0.10, "crypto": 0.05, "cash": 0.15}
+
+    r = risk.lower()
+    if r == "very low":
+        alloc["equities"] -= 0.20; alloc["bonds"] += 0.20; alloc["crypto"] = 0.0
+    elif r == "low":
+        alloc["equities"] -= 0.10; alloc["bonds"] += 0.10
+    elif r == "high":
+        alloc["equities"] += 0.10; alloc["crypto"] += 0.05; alloc["cash"] -= 0.05
+    elif r == "very high":
+        alloc["equities"] += 0.20; alloc["crypto"] += 0.10; alloc["cash"] -= 0.10
+
+    # sentiment tilt
+    s = float(np.clip(sentiment, -1, 1))
+    if s > 0:
+        alloc["equities"] += 0.05 * s
+        alloc["crypto"] += 0.03 * s
+        alloc["cash"] -= 0.03 * s
+    else:
+        alloc["bonds"] += 0.05 * abs(s)
+        alloc["cash"] += 0.03 * abs(s)
+        alloc["equities"] -= 0.03 * abs(s)
+
+    # normalize
+    total = sum(max(v, 0) for v in alloc.values())
+    for k in alloc:
+        alloc[k] = max(alloc[k], 0) / total
+    return alloc
+
+
+def propose_targets(
+    inp: AllocationInputs,
+    prev_weights: Optional[Dict[str, float]] = None
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    w_asset = build_asset_class_weights(inp.risk, inp.sentiment)
+
+    # Choose instruments
+    picks = []
+
+    if inp.include_equities:
+        # sector sleeves (equal weight across sectors within equities sleeve)
+        sector_names = list(EQUITY_SECTORS.keys())
+        sector_w = w_asset["equities"] / len(sector_names)
+
+        for sec in sector_names:
+            names = pick_top_tickers(EQUITY_SECTORS[sec], k=3)
+            w_each = sector_w / len(names)
+            for t in names:
+                picks.append((t, w_each, f"Equity:{sec}"))
+
+        if inp.include_equity_etfs:
+            etfs = pick_top_tickers(US_EQUITY_ETFS, k=2)
+            w_each = (w_asset["equities"] * 0.20) / len(etfs)  # 20% of equity sleeve into broad ETFs
+            # reduce existing equity sleeves proportionally
+            shrink = (w_asset["equities"] - w_asset["equities"] * 0.20) / w_asset["equities"]
+            picks = [(t, w * shrink, tag) if tag.startswith("Equity:") else (t, w, tag) for (t, w, tag) in picks]
+            for t in etfs:
+                picks.append((t, w_each, "Equity:ETF"))
+
+    if inp.include_bonds:
+        b = pick_top_tickers(BOND_ETFS, k=3)
+        w_each = w_asset["bonds"] / len(b)
+        picks += [(t, w_each, "Bond:ETF") for t in b]
+
+    if inp.include_cmd:
+        c = pick_top_tickers(CMD_ETFS, k=2)
+        w_each = w_asset["commodities"] / len(c)
+        picks += [(t, w_each, "Cmd:ETF") for t in c]
+
+    if inp.include_crypto:
+        if inp.include_crypto_etfs:
+            ce = pick_top_tickers(CRYPTO_ETFS, k=2)
+            w_each = w_asset["crypto"] / len(ce)
+            picks += [(t, w_each, "Crypto:ETF") for t in ce]
+        else:
+            # if you want spot crypto via yfinance tickers, keep it simple
+            picks.append(("BTC-USD", w_asset["crypto"], "Crypto:Spot"))
+
+    # Cash sleeve stays as residual (not a ticker)
+    df = pd.DataFrame(picks, columns=["ticker", "weight", "bucket"])
+    df = df.groupby(["ticker", "bucket"], as_index=False)["weight"].sum()
+    df["dollars"] = df["weight"] * inp.capital
+
+    # Turnover + cost estimate vs previous weights
+    new_w = df.groupby("ticker")["weight"].sum().to_dict()
+    if prev_weights is None:
+        turnover = float(df["weight"].sum())  # first build: treat as 100% buys
+    else:
+        all_t = set(prev_weights) | set(new_w)
+        turnover = 0.5 * sum(abs(new_w.get(t, 0) - prev_weights.get(t, 0)) for t in all_t)
+
+    turnover_capped = min(turnover, TURNOVER_CAP)
+    est_cost = inp.capital * turnover_capped * (TRADING_COST_BPS / 10_000)
+
+    df = df.sort_values(["bucket", "weight"], ascending=[True, False]).reset_index(drop=True)
+    print("===== STRATEGY A OUTPUT =====")
+    print("Asset-class weights:", {k: round(v, 4) for k, v in w_asset.items()})
+    print(f"Turnover (raw): {turnover:.3f} | Turnover (cap): {turnover_capped:.3f} | Est. one-way cost @10bps: ${est_cost:,.2f}")
+    return df, new_w
+
+
+# ---- Example run ----
+inputs = AllocationInputs(
+    capital=100_000,
+    risk="moderate",
+    sentiment=0.0,
+    include_equities=True,
+    include_bonds=True,
+    include_cmd=True,
+    include_crypto=False,
+    include_equity_etfs=True
+)
+
+targets_df, weights_state = propose_targets(inputs, prev_weights=None)
+targets_df
