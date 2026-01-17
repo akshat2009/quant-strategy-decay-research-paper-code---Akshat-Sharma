@@ -1,0 +1,203 @@
+# =========================
+# STRATEGY B — STOCK CHECKER SCORE (NON-AUTO)
+# Output: score/100, buy-hold-sell, confidence, position size, 10 bps cost estimate
+# =========================
+
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+TRADING_COST_BPS = 10  # 0.10% per trade
+
+
+@dataclass
+class StockCheckInputs:
+    tickers: List[str]
+    capital: float = 100_000
+    risk: str = "medium"          # very_low / low / medium / high / very_high
+    horizon: str = "medium"       # short / medium / long
+    mode: str = "normal"          # strict / normal / lenient
+
+
+def _ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False).mean()
+
+
+def _rsi(s: pd.Series, n: int = 14) -> pd.Series:
+    d = s.diff()
+    up = d.clip(lower=0)
+    dn = -d.clip(upper=0)
+    rs = up.rolling(n).mean() / (dn.rolling(n).mean() + 1e-12)
+    return 100 - (100 / (1 + rs))
+
+
+def _macd_hist(s: pd.Series) -> pd.Series:
+    m12 = _ema(s, 12)
+    m26 = _ema(s, 26)
+    macd = m12 - m26
+    sig = _ema(macd, 9)
+    return macd - sig
+
+
+def _ann_vol(s: pd.Series) -> float:
+    r = s.pct_change().dropna()
+    if r.empty:
+        return 1.0
+    return float(r.std() * np.sqrt(252))
+
+
+def _fund_lite(t: str) -> float:
+    # keep it stable: if info missing, return neutral 0.5
+    try:
+        info = yf.Ticker(t).get_info()
+    except Exception:
+        info = {}
+    if not info:
+        return 0.5
+
+    score = 0.5
+    pe = info.get("trailingPE")
+    roe = info.get("returnOnEquity")
+    d2e = info.get("debtToEquity")
+    pm = info.get("profitMargins")
+
+    if pe and pe < 25: score += 0.10
+    if roe and roe > 0.12: score += 0.10
+    if d2e and d2e < 120: score += 0.05
+    if pm and pm > 0.08: score += 0.08
+    return float(np.clip(score, 0, 1))
+
+
+def _sentiment_proxy() -> float:
+    # simple market regime proxy using SPX and VIX
+    try:
+        spx = yf.Ticker("^GSPC").history(period="6mo")["Close"].dropna()
+        vix = yf.Ticker("^VIX").history(period="6mo")["Close"].dropna()
+        if spx.empty or vix.empty:
+            return 0.5
+        r1m = float(spx.iloc[-1] / spx.iloc[-21] - 1) if len(spx) > 21 else 0.0
+        v = float(vix.iloc[-1])
+        s = 0.5 + np.clip(r1m / 0.10, -0.25, 0.25)  # +/-10% -> +/-0.25
+        if v < 18: s += 0.10
+        if v > 25: s -= 0.10
+        return float(np.clip(s, 0, 1))
+    except Exception:
+        return 0.5
+
+
+def score_stock(t: str, horizon: str, mode: str) -> Dict:
+    df = yf.download(t, period="1y", auto_adjust=True, progress=False)
+    if df is None or df.empty:
+        return {"ticker": t, "error": "no data"}
+
+    c = df["Close"].dropna()
+    if len(c) < 80:
+        return {"ticker": t, "error": "not enough history"}
+
+    ema20 = float(_ema(c, 20).iloc[-1])
+    ema50 = float(_ema(c, 50).iloc[-1])
+    macd = float(_macd_hist(c).iloc[-1])
+    rsi = float(_rsi(c).iloc[-1])
+    vol = _ann_vol(c)
+
+    # weights (sum doesn’t need to be 1; we normalize at end)
+    w = {"trend": 0.18, "macd": 0.15, "rsi": 0.12, "vol": 0.10, "fund": 0.25, "sent": 0.20}
+    if horizon == "short":
+        w["macd"] *= 1.2; w["trend"] *= 1.1; w["fund"] *= 0.8
+    elif horizon == "long":
+        w["fund"] *= 1.3; w["sent"] *= 0.9
+
+    strict = 1.15 if mode == "strict" else (0.95 if mode == "lenient" else 1.0)
+
+    # sub-scores in 0..1
+    trend_s = 1.0 if ema20 > ema50 else 0.0
+    macd_s = 1.0 if macd > 0 else 0.0
+    rsi_s = 1.0 - min(abs(rsi - 55.0) / 35.0, 1.0)
+    vol_s = 1.0 - min(vol / 0.60, 1.0)
+    fund_s = _fund_lite(t)
+    sent_s = _sentiment_proxy()
+
+    raw = (
+        w["trend"] * trend_s +
+        w["macd"] * macd_s +
+        w["rsi"]  * rsi_s +
+        w["vol"]  * vol_s +
+        w["fund"] * fund_s +
+        w["sent"] * sent_s
+    )
+
+    max_raw = sum(w.values())
+    s01 = float(np.clip((raw / (max_raw + 1e-12)) / strict, 0, 1))
+    score100 = round(100 * s01, 1)
+
+    if score100 >= 70:
+        signal = "buy"
+    elif score100 >= 45:
+        signal = "hold"
+    else:
+        signal = "sell"
+
+    return {
+        "ticker": t.upper(),
+        "price": round(float(c.iloc[-1]), 2),
+        "score_100": score100,
+        "signal": signal,
+        "confidence": score100,  # keep same scale for your paper wording
+        "vol_ann": round(vol, 3),
+        "rsi": round(rsi, 1),
+        "ema20_gt_ema50": bool(ema20 > ema50),
+        "macd_hist": round(macd, 4),
+    }
+
+
+def position_size(score100: float, risk: str, capital: float) -> Tuple[float, float]:
+    caps = {"very_low": 0.02, "low": 0.04, "medium": 0.06, "high": 0.10, "very_high": 0.15}
+    cap = caps.get(risk.lower(), 0.06)
+
+    if score100 >= 75:
+        pct = cap
+    elif score100 >= 60:
+        pct = cap * 0.70
+    elif score100 >= 50:
+        pct = cap * 0.40
+    else:
+        pct = cap * 0.20
+
+    dollars = round(capital * pct, 2)
+    est_cost = round(dollars * (TRADING_COST_BPS / 10_000), 2)  # one-way
+    return dollars, est_cost
+
+
+def run_stock_checker(inp: StockCheckInputs) -> pd.DataFrame:
+    rows = []
+    for t in inp.tickers:
+        out = score_stock(t, horizon=inp.horizon, mode=inp.mode)
+        if "error" in out:
+            rows.append(out)
+            continue
+        dollars, est_cost = position_size(out["score_100"], inp.risk, inp.capital)
+        out["recommended_$"] = dollars if out["signal"] == "buy" else (0.0 if out["signal"] == "sell" else round(0.25 * dollars, 2))
+        out["est_one_way_cost_$"] = est_cost if out["recommended_$"] > 0 else 0.0
+        rows.append(out)
+
+    df = pd.DataFrame(rows)
+    if "score_100" in df.columns:
+        df = df.sort_values("score_100", ascending=False)
+    return df.reset_index(drop=True)
+
+
+# ---- Example run ----
+inp = StockCheckInputs(
+    tickers=["NVDA","AAPL","MSFT","AMZN","JPM","XOM","GLD"],
+    capital=100_000,
+    risk="high",
+    horizon="medium",
+    mode="normal"
+)
+
+stock_report = run_stock_checker(inp)
+stock_report
